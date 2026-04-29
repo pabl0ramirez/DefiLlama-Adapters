@@ -215,17 +215,43 @@ const FAMILIES = {
 
 // ── Adapter coverage index ─────────────────────────────────────────────────
 
+// Registries that DeFiLlama maintainers use as canonical "we already track
+// this" sources.  Keeping these in sync with projects/*/index.js for coverage
+// detection closes the duplicate-PR class of failure.  Born from 2026-04-29
+// audit which revealed 7 of 11 campaign PRs were duplicates of
+// registries/uniswapV3.js entries — Hercules V3 line 639, KittenSwap 944,
+// QuickSwap V3 1092, Kodiak V3 1596, Lynex V2 14, plus 4 earlier closures.
+const REGISTRY_FILES = [
+  'registries/uniswapV3.js',  // Uniswap V3 + Algebra + Algebra forks
+  'registries/balancer.js',   // Balancer V2 deployments
+  'registries/aave.js',       // Aave V1/V2
+  'registries/aaveV3.js',     // Aave V3
+]
+
 function buildAdapterIndex() {
-  const projectsDir = path.join(__dirname, '..', 'projects')
+  const root = path.join(__dirname, '..')
+  const projectsDir = path.join(root, 'projects')
   const adapters = []
+
+  // 1) Per-protocol adapters in projects/*/index.js
   for (const entry of fs.readdirSync(projectsDir, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue
     if (entry.name === 'helper') continue
     const indexPath = path.join(projectsDir, entry.name, 'index.js')
     if (!fs.existsSync(indexPath)) continue
-    adapters.push({ name: entry.name, path: indexPath })
+    adapters.push({ name: entry.name, path: indexPath, kind: 'project' })
   }
-  // Cache file content for mention checks (read lazily)
+
+  // 2) Canonical registry files — treated as synthetic adapters whose content
+  //    is the full registry file.  The existing adapterCoversChain() and
+  //    adapterMentions() regexes match registry entries the same way they
+  //    match project files, so coverage detection is uniform across both.
+  for (const rel of REGISTRY_FILES) {
+    const abs = path.join(root, rel)
+    if (!fs.existsSync(abs)) continue
+    adapters.push({ name: `registry:${rel}`, path: abs, kind: 'registry' })
+  }
+
   return adapters
 }
 
