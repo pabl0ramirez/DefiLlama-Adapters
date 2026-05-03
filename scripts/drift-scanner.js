@@ -524,6 +524,145 @@ async function fetchLlamaCoverage() {
   })
 }
 
+// ── v2.5: Contract attribution via Blockscout V2 (keyless) ────────────────
+// Primary: Blockscout /api/v2/smart-contracts/{address} — no API key needed.
+// Fallback: Etherscan V2 — only used when ETHERSCAN_API_KEY env var is set.
+// Returns null gracefully for unsupported chains — no attribution > wrong data.
+
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || ''
+
+// Blockscout V2 base URLs — no API key required, returns {name, is_verified, ...}
+const CHAIN_BLOCKSCOUT = {
+  ethereum:  'https://eth.blockscout.com',
+  arbitrum:  'https://arbitrum.blockscout.com',
+  optimism:  'https://optimism.blockscout.com',
+  base:      'https://base.blockscout.com',
+  polygon:   'https://polygon.blockscout.com',
+  xdai:      'https://gnosis.blockscout.com',
+  celo:      'https://celo.blockscout.com',
+  scroll:    'https://scroll.blockscout.com',
+  linea:     'https://explorer.linea.build',
+  mode:      'https://explorer.mode.network',
+  metis:     'https://andromeda-explorer.metis.io',
+  kava:      'https://kavascan.com',
+  aurora:    'https://explorer.aurora.dev',
+  manta:     'https://manta-pacific.blockscout.com',
+  unichain:  'https://unichain.blockscout.com',
+  ink:       'https://explorer.inkonchain.com',
+  berachain: 'https://berachain.blockscout.com',
+  sonic:     'https://sonicscan.org',
+  mantle:    'https://explorer.mantle.xyz',
+  fraxtal:   'https://fraxscan.com',
+  blast:     'https://blastexplorer.io',
+  taiko:     'https://taikoscan.io',
+  corn:      'https://cornscan.io',
+  era:       'https://explorer.zksync.io',
+  boba:      'https://bobascan.com',
+}
+
+// Etherscan V2 chain IDs — used when ETHERSCAN_API_KEY is set (covers chains without Blockscout)
+const CHAIN_ETHERSCAN_ID = {
+  ethereum: 1, arbitrum: 42161, optimism: 10, base: 8453, polygon: 137,
+  avax: 43114, bsc: 56, linea: 59144, scroll: 534352, blast: 81457,
+  mantle: 5000, xdai: 100, celo: 42220, cronos: 25, moonbeam: 1284,
+  moonriver: 1285, fraxtal: 252, taiko: 167000, metis: 1088, mode: 34443,
+  sonic: 146, era: 324, kava: 2222,
+}
+
+/**
+ * Fetch contract name from Blockscout V2 (keyless).
+ * @param {string} baseUrl - Blockscout base URL for the chain
+ * @param {string} address
+ * @returns {Promise<{name:string,verified:boolean}|null>}
+ */
+function _fetchBlockscout(baseUrl, address) {
+  return new Promise((resolve) => {
+    const url = `${baseUrl}/api/v2/smart-contracts/${address}`
+    const req = https.get(url, { timeout: 8000 }, (res) => {
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => {
+        try {
+          if (res.statusCode !== 200) return resolve(null)
+          const body = JSON.parse(Buffer.concat(chunks).toString())
+          const name = body.name || null
+          if (!name) return resolve(null)
+          resolve({ name, verified: body.is_verified === true })
+        } catch { resolve(null) }
+      })
+    })
+    req.on('error', () => resolve(null))
+    req.on('timeout', () => { req.destroy(); resolve(null) })
+  })
+}
+
+/**
+ * Fetch contract name from Etherscan V2 (requires ETHERSCAN_API_KEY).
+ * @param {number} chainId
+ * @param {string} address
+ * @returns {Promise<{name:string,verified:boolean}|null>}
+ */
+function _fetchEtherscan(chainId, address) {
+  return new Promise((resolve) => {
+    const qs = new URLSearchParams({
+      chainid: String(chainId), module: 'contract',
+      action: 'getsourcecode', address, apikey: ETHERSCAN_API_KEY,
+    })
+    const req = https.get(`https://api.etherscan.io/v2/api?${qs}`, { timeout: 8000 }, (res) => {
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString())
+          if (body.status !== '1' || !body.result?.[0]) return resolve(null)
+          const name = body.result[0].ContractName || null
+          resolve(name ? { name, verified: true } : null)
+        } catch { resolve(null) }
+      })
+    })
+    req.on('error', () => resolve(null))
+    req.on('timeout', () => { req.destroy(); resolve(null) })
+  })
+}
+
+/**
+ * Fetch contract attribution for a factory address.
+ * Tries Blockscout V2 first (keyless), then Etherscan V2 if API key is set.
+ * @param {string} chain
+ * @param {string} address
+ * @returns {Promise<{name:string,verified:boolean}|null>}
+ */
+async function fetchAttribution(chain, address) {
+  const bsBase = CHAIN_BLOCKSCOUT[chain]
+  if (bsBase) {
+    const result = await _fetchBlockscout(bsBase, address)
+    if (result) return result
+  }
+  if (ETHERSCAN_API_KEY) {
+    const chainId = CHAIN_ETHERSCAN_ID[chain]
+    if (chainId) return _fetchEtherscan(chainId, address)
+  }
+  return null
+}
+
+/**
+ * Get attribution for an address, using the persistent cache (lazy fetch).
+ * Stores null for failed lookups so we never retry the same address twice.
+ * @param {string} chain
+ * @param {string} address
+ * @param {Object} cache - the live cache object (mutated in place)
+ * @returns {Promise<{name:string,verified:boolean}|null>}
+ */
+async function getAttribution(chain, address, cache) {
+  if (!cache.attribution) cache.attribution = {}
+  if (Object.prototype.hasOwnProperty.call(cache.attribution, address)) {
+    return cache.attribution[address]  // null means already tried and failed
+  }
+  const result = await fetchAttribution(chain, address)
+  cache.attribution[address] = result
+  return result
+}
+
 // ── Chain list ─────────────────────────────────────────────────────────────
 
 // EVM-only chains with a known RPC in the @defillama/sdk provider registry.
@@ -747,14 +886,24 @@ async function main() {
     }).join('  ')
     console.log(`Scan windows (blocks): ${windows}`)
   }
+
+  // v2.5: pre-fetch attributions for all gaps in parallel (lazy-cached per address)
+  process.stdout.write(`Attributing ${gaps.length} factory addresses...`)
+  const gapAttrs = await Promise.all(gaps.map(g => getAttribution(g.chain, g.info.address, cache)))
+  const attrHits = gapAttrs.filter(Boolean).length
+  console.log(` ${attrHits}/${gaps.length} resolved`)
+
   console.log(`DEPLOYED BUT UNCOVERED — Top ${gaps.length} gaps ranked by chain TVL`)
   console.log(`${'Chain'.padEnd(18)} ${'Family'.padEnd(18)} ${'ChainTVL'.padStart(9)} ${'Pools'.padStart(6)}  Address`)
   console.log('─'.repeat(82))
-  for (const g of gaps) {
-    const pools    = g.info.pools == null ? '     ?' : String(g.info.pools).padStart(6)
-    const tvl      = fmtUsd(g.chainTvlUsd)
-    const addr     = g.info.address.slice(0, 42)
-    console.log(`${g.chain.padEnd(18)} ${g.family.padEnd(18)} ${tvl} ${pools}  ${addr}`)
+  for (let i = 0; i < gaps.length; i++) {
+    const g    = gaps[i]
+    const attr = gapAttrs[i]
+    const pools = g.info.pools == null ? '     ?' : String(g.info.pools).padStart(6)
+    const tvl   = fmtUsd(g.chainTvlUsd)
+    const addr  = g.info.address.slice(0, 42)
+    const label = attr?.name ? `  (${attr.name})` : ''
+    console.log(`${g.chain.padEnd(18)} ${g.family.padEnd(18)} ${tvl} ${pools}  ${addr}${label}`)
   }
 
   const covered    = deployed.filter(r => r.covered)
@@ -801,12 +950,13 @@ async function main() {
   if (JSON_OUT) {
     const report = {
       timestamp: new Date().toISOString(),
-      gaps: gaps.map(g => ({
+      gaps: gaps.map((g, i) => ({
         chain: g.chain,
         family: g.family,
         pools: g.info.pools ?? null,
         chainTvlUsd: g.chainTvlUsd ?? null,
         address: g.info.address,
+        contractName: gapAttrs[i]?.name ?? null,
       })),
       summary: {
         covered: covered.length,
