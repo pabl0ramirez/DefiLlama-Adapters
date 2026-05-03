@@ -404,10 +404,65 @@ async function findFactoriesFromEvents(chain, topic, maxBlocks = 4_000_000, chun
   }
 }
 
-// ── DeFiLlama API coverage (prevents submitting already-tracked protocols) ──
+// ── DeFiLlama API coverage + chain TVL (v2.2) ─────────────────────────────
 // DeFiLlama's internal adapter DB is larger than the public GitHub repo.
 // A protocol can be tracked (appears in chainTvls) with no public adapter file.
-// We fetch the live protocol list and build a Set<chain> per protocol family.
+// We fetch the live protocol list AND per-chain total TVL.
+// v2.2: gaps are re-ranked by chain TVL (bigger chain → higher priority gap),
+// with pool count as tiebreak.  A 35-pool factory on Ethereum ranks above a
+// 200-pool factory on a $1M chain.
+
+// Known mismatches between our chain slugs (EVM_CHAINS) and the 'name' field
+// returned by api.llama.fi/v2/chains.
+const CHAIN_SLUG_ALIASES = {
+  'bsc':     ['bnb chain', 'binance smart chain', 'bsc'],
+  'avax':    ['avalanche', 'avax'],
+  'xdai':    ['gnosis', 'xdai'],
+  'era':     ['zksync era', 'zksync', 'era'],
+  'polygon': ['polygon', 'matic'],
+  'metis':   ['metis andromeda', 'metis'],
+  'aurora':  ['aurora'],
+  'celo':    ['celo'],
+  'rsk':     ['rootstock', 'rsk'],
+  'moonbeam':['moonbeam'],
+  'moonriver':['moonriver'],
+}
+
+/**
+ * Fetch total USD TVL per chain from api.llama.fi/v2/chains.
+ * @returns {Promise<Map<string,number>>} chain slug → TVL USD (empty Map on failure)
+ */
+async function fetchChainTvl() {
+  return new Promise((resolve) => {
+    const req = https.get('https://api.llama.fi/v2/chains', { timeout: 15000 }, (res) => {
+      const chunks = []
+      res.on('data', c => chunks.push(c))
+      res.on('end', () => {
+        try {
+          const entries = JSON.parse(Buffer.concat(chunks).toString())
+          // Build nameMap: normalized-lowercase-name → tvl
+          const nameMap = new Map()
+          for (const e of entries) {
+            const key = (e.name || '').toLowerCase().trim()
+            if (e.tvl && key) nameMap.set(key, e.tvl)
+          }
+          // Map our EVM_CHAINS slugs → tvl via direct match then aliases
+          const result = new Map()
+          for (const slug of EVM_CHAINS) {
+            if (nameMap.has(slug)) { result.set(slug, nameMap.get(slug)); continue }
+            const aliases = CHAIN_SLUG_ALIASES[slug] || []
+            for (const alias of aliases) {
+              if (nameMap.has(alias)) { result.set(slug, nameMap.get(alias)); break }
+            }
+          }
+          resolve(result)
+        } catch { resolve(new Map()) }
+      })
+    })
+    req.on('error', () => resolve(new Map()))
+    req.on('timeout', () => { req.destroy(); resolve(new Map()) })
+  })
+}
 
 async function fetchLlamaCoverage() {
   return new Promise((resolve) => {
@@ -500,9 +555,12 @@ async function main() {
   const familyKeys = resolveFamilies()
   const adapters = buildAdapterIndex()
 
-  process.stdout.write('Fetching DeFiLlama API coverage...')
-  const llamaCoverage = await fetchLlamaCoverage()
-  console.log(llamaCoverage ? ' ok' : ' failed (will rely on local adapter scan only)')
+  process.stdout.write('Fetching DeFiLlama coverage + chain TVL...')
+  const [llamaCoverage, chainTvlMap] = await Promise.all([
+    fetchLlamaCoverage(),
+    fetchChainTvl(),
+  ])
+  console.log(` coverage=${llamaCoverage ? 'ok' : 'failed'} chains=${chainTvlMap.size}`)
 
   console.log(`\nDeFiLlama Drift Scanner`)
   console.log(`═══════════════════════════════════════════════════════`)
@@ -533,7 +591,8 @@ async function main() {
               ? llamaCoverage[llamaKey].has(chain.toLowerCase())
               : false
             const covered = localCovered || apiCovered
-            return { chain, familyKey, family: family.name, info, covered, apiCovered }
+            const chainTvlUsd = chainTvlMap.get(chain.toLowerCase()) ?? 0
+            return { chain, familyKey, family: family.name, info, covered, apiCovered, chainTvlUsd }
           })
         } catch (err) {
           console.warn(`  [warn] detect ${familyKey}/${chain}: ${err.message}`)
@@ -554,17 +613,33 @@ async function main() {
 
   const deployed = raw.flat().filter(Boolean)
   const gaps     = deployed.filter(r => !r.covered)
-    .sort((a, b) => (b.info.pools ?? -1) - (a.info.pools ?? -1))
+    .sort((a, b) => {
+      // v2.2: primary rank by chain TVL descending (bigger chain = higher-priority gap)
+      const tvlDiff = (b.chainTvlUsd ?? 0) - (a.chainTvlUsd ?? 0)
+      if (tvlDiff !== 0) return tvlDiff
+      // Tiebreak: pool count descending
+      return (b.info.pools ?? -1) - (a.info.pools ?? -1)
+    })
     .slice(0, TOP)
 
   // ── Report ───────────────────────────────────────────────────────────────
-  console.log(`DEPLOYED BUT UNCOVERED — Top ${gaps.length} gaps by pool count`)
-  console.log(`${'Chain'.padEnd(18)} ${'Family'.padEnd(18)} ${'Pools'.padStart(6)}  Address`)
-  console.log('─'.repeat(72))
+  function fmtUsd(n) {
+    if (!n) return '       ?'
+    if (n >= 1e12) return `$${(n / 1e12).toFixed(1)}T`.padStart(8)
+    if (n >= 1e9)  return `$${(n / 1e9).toFixed(1)}B`.padStart(8)
+    if (n >= 1e6)  return `$${(n / 1e6).toFixed(1)}M`.padStart(8)
+    if (n >= 1e3)  return `$${(n / 1e3).toFixed(0)}K`.padStart(8)
+    return `$${n.toFixed(0)}`.padStart(8)
+  }
+
+  console.log(`DEPLOYED BUT UNCOVERED — Top ${gaps.length} gaps ranked by chain TVL`)
+  console.log(`${'Chain'.padEnd(18)} ${'Family'.padEnd(18)} ${'ChainTVL'.padStart(9)} ${'Pools'.padStart(6)}  Address`)
+  console.log('─'.repeat(82))
   for (const g of gaps) {
-    const pools = g.info.pools == null ? '     ?' : String(g.info.pools).padStart(6)
-    const addr  = g.info.address.slice(0, 42)
-    console.log(`${g.chain.padEnd(18)} ${g.family.padEnd(18)} ${pools}  ${addr}`)
+    const pools    = g.info.pools == null ? '     ?' : String(g.info.pools).padStart(6)
+    const tvl      = fmtUsd(g.chainTvlUsd)
+    const addr     = g.info.address.slice(0, 42)
+    console.log(`${g.chain.padEnd(18)} ${g.family.padEnd(18)} ${tvl} ${pools}  ${addr}`)
   }
 
   const covered    = deployed.filter(r => r.covered)
@@ -615,6 +690,7 @@ async function main() {
         chain: g.chain,
         family: g.family,
         pools: g.info.pools ?? null,
+        chainTvlUsd: g.chainTvlUsd ?? null,
         address: g.info.address,
       })),
       summary: {
