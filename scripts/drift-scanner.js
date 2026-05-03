@@ -51,12 +51,13 @@ const CONCURRENCY        = parseIntFlag('--concurrency', 15, { min: 1 })
 const GEN_STUBS          = has('--gen-stubs')
 const TIMEOUT_MS         = parseIntFlag('--timeout', 6000, { min: 1 })
 const JSON_OUT           = flag('--json', null)
-// v2.3: --max-blocks overrides the per-family maxScanBlocks for every family in this run.
-// Useful for deep-history forensic scans: node scripts/drift-scanner.js --max-blocks 20000000
+// v2.3: --max-blocks overrides per-family maxScanBlocks
 const MAX_BLOCKS_OVERRIDE = (() => {
   const v = parseInt(flag('--max-blocks', ''), 10)
   return Number.isFinite(v) && v > 0 ? v : null
 })()
+// v2.4: --full-rescan ignores the incremental cache and scans the full window
+const FULL_RESCAN = has('--full-rescan')
 
 // ── Protocol family definitions ────────────────────────────────────────────
 // Each family describes how to detect deployment and how to generate an adapter.
@@ -67,14 +68,14 @@ const FAMILIES = {
 
   'balancer-v2': {
     name: 'Balancer V2',
-    // v2.3: scan last 4M blocks — Balancer V2 launched Nov 2021 (~4M blocks ago on most chains)
     maxScanBlocks: 4_000_000,
-    detect: async (chain, maxBlocks) => {
+    usesEventScan: true,
+    detect: async (chain, maxBlocks, fromBlock = null, onScanned = null) => {
       const code = await getCode(chain, BALANCER_VAULT)
       if (code == null || code.length <= 4) return null
       const pools = await countEvents(chain, BALANCER_VAULT,
         '0x3c13bc30b8e878c53fd2a36b679409c073afd75950be43d8858768e956fbc20e',
-        maxBlocks)
+        maxBlocks, fromBlock, onScanned)
       return { address: BALANCER_VAULT, pools }
     },
     coveredBy: (chain, adapters) =>
@@ -93,13 +94,13 @@ const FAMILIES = {
       '0xcb2436774C3e191c85056d248EF4260ce5f27A9D',
     ],
     poolTopic: '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118',
-    // v2.3: Uniswap V3 launched May 2021 — 4M blocks covers most deployments
     maxScanBlocks: 4_000_000,
-    detect: async function(chain, maxBlocks) {
+    usesEventScan: true,
+    detect: async function(chain, maxBlocks, fromBlock = null, onScanned = null) {
       for (const factory of this.factories) {
         const code = await getCode(chain, factory)
         if (code != null && code.length > 4) {
-          const pools = await countEvents(chain, factory, this.poolTopic, maxBlocks)
+          const pools = await countEvents(chain, factory, this.poolTopic, maxBlocks, fromBlock, onScanned)
           return { address: factory, pools }
         }
       }
@@ -118,10 +119,10 @@ const FAMILIES = {
     name: 'Algebra CLMM',
     poolTopic: '0x91ccaa7a278130b65168c3a0c8d3bcae84cf5e43704342bd3ec0b59e59c036db',
     // v2.3: 15M blocks — covers the mystery 2021 Ethereum Algebra factory (0xfb8ed348...).
-    // The 4M default used to miss it entirely; 15M unblocks deep-history Algebra scans.
     maxScanBlocks: 15_000_000,
-    detect: async function(chain, maxBlocks) {
-      const candidates = await findFactoriesFromEvents(chain, this.poolTopic, maxBlocks)
+    usesEventScan: true,
+    detect: async function(chain, maxBlocks, fromBlock = null, onScanned = null) {
+      const candidates = await findFactoriesFromEvents(chain, this.poolTopic, maxBlocks, 100_000, 0, fromBlock, onScanned)
       if (!candidates || !candidates.length) return null
       const validated = []
       for (const c of candidates) {
@@ -200,15 +201,15 @@ const FAMILIES = {
   'pancakeswap-v3': {
     name: 'PancakeSwap V3',
     factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865',
-    // v2.3: PCS V3 launched Apr 2023 — 6M blocks covers all deployments
     maxScanBlocks: 6_000_000,
-    detect: async (chain, maxBlocks) => {
+    usesEventScan: true,
+    detect: async (chain, maxBlocks, fromBlock = null, onScanned = null) => {
       const factory = '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865'
       const code = await getCode(chain, factory)
       if (code == null || code.length <= 4) return null
       const pools = await countEvents(chain, factory,
         '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118',
-        maxBlocks)
+        maxBlocks, fromBlock, onScanned)
       return { address: factory, pools }
     },
     coveredBy: (chain, adapters) =>
@@ -324,12 +325,15 @@ async function callView(chain, address, funcSig, args = []) {
 }
 
 // Count events emitted from a specific address (last 2M blocks as proxy).
+// fromBlockOverride: if provided, start scan here instead of (latest - maxBlocks).
+// onScanned(latest): called with the toBlock once the scan completes — used by v2.4 cache.
 // Returns null on RPC failure so callers can distinguish "no events" from "unknown".
-async function countEvents(chain, address, topic, maxBlocks = 2_000_000) {
+async function countEvents(chain, address, topic, maxBlocks = 2_000_000, fromBlockOverride = null, onScanned = null) {
   try {
     const provider = sdk.getProvider(chain)
     const latest = await withTimeout(provider.getBlockNumber(), TIMEOUT_MS)
-    const fromBlock = Math.max(0, latest - maxBlocks)
+    onScanned?.(latest)
+    const fromBlock = fromBlockOverride != null ? fromBlockOverride : Math.max(0, latest - maxBlocks)
     const logs = await withTimeout(
       provider.getLogs({ address, topics: [topic], fromBlock, toBlock: latest }),
       TIMEOUT_MS * 3,
@@ -343,12 +347,15 @@ async function countEvents(chain, address, topic, maxBlocks = 2_000_000) {
 
 // Find all addresses emitting a given topic (for dynamic factory discovery).
 // Pages backward in chunks to catch old factories and survive provider log-limit failures.
+// fromBlockOverride: explicit start block (v2.4 incremental scan).
+// onScanned(latest): cache callback — receives the toBlock once scan starts.
 // Returns null on outer failure so callers treat it as "unknown", not "not deployed".
-async function findFactoriesFromEvents(chain, topic, maxBlocks = 4_000_000, chunkSize = 100_000, floorBlock = 0) {
+async function findFactoriesFromEvents(chain, topic, maxBlocks = 4_000_000, chunkSize = 100_000, floorBlock = 0, fromBlockOverride = null, onScanned = null) {
   try {
     const provider = sdk.getProvider(chain)
     const latest = await withTimeout(provider.getBlockNumber(), TIMEOUT_MS)
-    const bottomBlock = Math.max(floorBlock, latest - maxBlocks)
+    onScanned?.(latest)
+    const bottomBlock = fromBlockOverride != null ? fromBlockOverride : Math.max(floorBlock, latest - maxBlocks)
     const counts = {}
     const samplePool = {} // factory address → one emitted pool address (from log.data)
 
@@ -556,10 +563,57 @@ const FAMILY_LLAMA_KEY = {
   'pancakeswap-v3': 'pancakeswap',
 }
 
+// ── v2.4: Incremental JSON cache ───────────────────────────────────────────
+// Stores per-(chain × family) scan progress and accumulated factory discoveries.
+// Only event-scanning families (usesEventScan: true) update scan state.
+// Coverage is re-evaluated fresh each run — merged adapters auto-close gaps.
+const CACHE_VERSION = 1
+const CACHE_PATH = path.join(__dirname, '..', 'data', 'drift_scanner_cache.json')
+
+function loadCache() {
+  if (FULL_RESCAN) {
+    console.log('  [cache] --full-rescan: ignoring existing cache')
+    return { version: CACHE_VERSION, scanState: {}, factories: {} }
+  }
+  try {
+    if (!fs.existsSync(CACHE_PATH)) return { version: CACHE_VERSION, scanState: {}, factories: {} }
+    const raw = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'))
+    if (raw.version !== CACHE_VERSION) {
+      console.warn('  [cache] version mismatch — starting fresh')
+      return { version: CACHE_VERSION, scanState: {}, factories: {} }
+    }
+    const stateKeys = Object.keys(raw.scanState ?? {}).length
+    const factoryCount = Object.values(raw.factories ?? {}).reduce((n, m) => n + Object.keys(m).length, 0)
+    console.log(`  [cache] ${stateKeys} scan entries, ${factoryCount} known factories`)
+    return raw
+  } catch (err) {
+    console.warn(`  [cache] load failed: ${err.message} — starting fresh`)
+    return { version: CACHE_VERSION, scanState: {}, factories: {} }
+  }
+}
+
+function saveCache(cache) {
+  try {
+    const dir = path.dirname(CACHE_PATH)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    const tmp = CACHE_PATH + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify(cache, null, 2))
+    fs.renameSync(tmp, CACHE_PATH)
+    const stateKeys = Object.keys(cache.scanState ?? {}).length
+    const factoryCount = Object.values(cache.factories ?? {}).reduce((n, m) => n + Object.keys(m).length, 0)
+    console.log(`  [cache] saved ${stateKeys} entries, ${factoryCount} factories → ${path.relative(process.cwd(), CACHE_PATH)}`)
+  } catch (err) {
+    console.warn(`  [cache] save failed: ${err.message}`)
+  }
+}
+
 async function main() {
   const chains  = resolveChains()
   const familyKeys = resolveFamilies()
   const adapters = buildAdapterIndex()
+
+  // v2.4: load incremental cache before any scanning
+  const cache = loadCache()
 
   process.stdout.write('Fetching DeFiLlama coverage + chain TVL...')
   const [llamaCoverage, chainTvlMap] = await Promise.all([
@@ -573,6 +627,12 @@ async function main() {
   console.log(`Chains:   ${chains.length}  |  Families: ${familyKeys.join(', ')}`)
   console.log(`Adapters: ${adapters.length} existing  |  Concurrency: ${CONCURRENCY}`)
   if (MAX_BLOCKS_OVERRIDE) console.log(`MaxBlocks override: ${MAX_BLOCKS_OVERRIDE.toLocaleString()} (--max-blocks)`)
+  if (FULL_RESCAN) console.log(`Mode: full rescan (--full-rescan)`)
+  else {
+    const cachedChains = new Set(Object.keys(cache.scanState).map(k => k.split(':')[0])).size
+    if (cachedChains > 0)
+      console.log(`Cache: incremental — ${cachedChains} chains with prior scan state`)
+  }
   console.log(`═══════════════════════════════════════════════════════\n`)
 
   const tasks = []
@@ -580,27 +640,66 @@ async function main() {
     for (const familyKey of familyKeys) {
       const family = FAMILIES[familyKey]
       if (!family) { console.warn(`Unknown family: ${familyKey}`); continue }
-      // v2.3: resolve effective block window — CLI override beats family default
       const effectiveMaxBlocks = MAX_BLOCKS_OVERRIDE ?? family.maxScanBlocks ?? 4_000_000
+      const cacheKey = `${chain}:${familyKey}`
       tasks.push(async () => {
         try {
-          const detected = await family.detect(chain, effectiveMaxBlocks)
-          if (!detected) return []
-          // Algebra returns an array (one entry per factory); others return a single object
-          const infos = Array.isArray(detected) ? detected : [detected]
-          return infos.map(info => {
-            // Algebra coveredBy takes (chain, info, adapters) to check per factory address
+          // v2.4: incremental fromBlock — only scan new blocks since last run
+          const cachedScan = cache.scanState[cacheKey]
+          const fromBlock = (family.usesEventScan && !FULL_RESCAN && cachedScan?.lastBlock != null)
+            ? cachedScan.lastBlock + 1
+            : null  // null → full window via maxScanBlocks
+
+          // onScanned fires with `latest` the first time a block-number fetch succeeds.
+          // Used to update scanState without an extra RPC call.
+          let scannedToBlock = null
+          const onScanned = (latest) => { if (scannedToBlock == null) scannedToBlock = latest }
+
+          const detected = await family.detect(chain, effectiveMaxBlocks, fromBlock, onScanned)
+
+          // v2.4: merge newly discovered factories into persistent cache
+          if (family.usesEventScan && scannedToBlock != null) {
+            const now = new Date().toISOString()
+            cache.scanState[cacheKey] = { lastBlock: scannedToBlock, lastRunTs: now }
+            if (detected) {
+              if (!cache.factories[cacheKey]) cache.factories[cacheKey] = {}
+              const newInfos = Array.isArray(detected) ? detected : [detected]
+              for (const f of newInfos) {
+                const prev = cache.factories[cacheKey][f.address]
+                cache.factories[cacheKey][f.address] = {
+                  firstSeen: prev?.firstSeen ?? now,
+                  pools: Math.max(prev?.pools ?? 0, f.pools ?? 0),
+                  samplePool: f.samplePool ?? prev?.samplePool ?? null,
+                }
+              }
+            }
+          }
+
+          // For event-scanning families: evaluate ALL cached factories (not just new ones).
+          // This ensures factories from previous runs continue to surface as gaps until covered.
+          // For non-event families (aave-v3, curve, velodrome-cl): use raw detect result.
+          let allInfos
+          if (family.usesEventScan) {
+            allInfos = Object.entries(cache.factories[cacheKey] ?? {})
+              .map(([address, meta]) => ({ address, pools: meta.pools, samplePool: meta.samplePool }))
+          } else {
+            if (!detected) return []
+            allInfos = Array.isArray(detected) ? detected : [detected]
+          }
+
+          if (!allInfos.length) return []
+
+          const chainTvlUsd = chainTvlMap.get(chain.toLowerCase()) ?? 0
+          const llamaKey = FAMILY_LLAMA_KEY[familyKey]
+          const apiCovered = llamaCoverage && llamaKey && familyKey !== 'algebra'
+            ? llamaCoverage[llamaKey].has(chain.toLowerCase())
+            : false
+
+          return allInfos.map(info => {
             const localCovered = familyKey === 'algebra'
               ? family.coveredBy(chain, info, adapters)
               : family.coveredBy(chain, adapters)
-            const llamaKey = FAMILY_LLAMA_KEY[familyKey]
-            // Algebra uses per-factory localCovered; chain-level API check would hide
-            // uncovered factories when one is already tracked — skip it for algebra.
-            const apiCovered = llamaCoverage && llamaKey && familyKey !== 'algebra'
-              ? llamaCoverage[llamaKey].has(chain.toLowerCase())
-              : false
             const covered = localCovered || apiCovered
-            const chainTvlUsd = chainTvlMap.get(chain.toLowerCase()) ?? 0
             return { chain, familyKey, family: family.name, info, covered, apiCovered, chainTvlUsd }
           })
         } catch (err) {
@@ -719,6 +818,9 @@ async function main() {
     fs.writeFileSync(JSON_OUT, JSON.stringify(report, null, 2))
     console.log(`\nJSON report written to ${JSON_OUT}`)
   }
+
+  // v2.4: persist incremental cache so next run only scans new blocks
+  saveCache(cache)
 
   console.log('\nDone.\n')
 }

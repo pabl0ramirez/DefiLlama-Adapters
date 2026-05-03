@@ -14,3 +14,6 @@ projects/binance/data.csv
 
 scripts/tvlModules.json
 .claude
+# drift-scanner incremental cache (v2.4)
+data/drift_scanner_cache.json
+data/drift_scanner_cache.json.tmp
