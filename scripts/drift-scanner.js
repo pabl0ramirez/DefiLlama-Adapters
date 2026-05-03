@@ -44,13 +44,19 @@ function parseIntFlag(name, def, { min = 1 } = {}) {
   return Number.isFinite(v) && v >= min ? v : def
 }
 
-const CHAINS_ARG    = flag('--chains', 'all')
-const FAMILIES_ARG  = flag('--families', 'all')
-const TOP           = parseIntFlag('--top', 50, { min: 0 })
-const CONCURRENCY   = parseIntFlag('--concurrency', 15, { min: 1 })
-const GEN_STUBS     = has('--gen-stubs')
-const TIMEOUT_MS    = parseIntFlag('--timeout', 6000, { min: 1 })
-const JSON_OUT      = flag('--json', null)   // path to write structured gap report
+const CHAINS_ARG         = flag('--chains', 'all')
+const FAMILIES_ARG       = flag('--families', 'all')
+const TOP                = parseIntFlag('--top', 50, { min: 0 })
+const CONCURRENCY        = parseIntFlag('--concurrency', 15, { min: 1 })
+const GEN_STUBS          = has('--gen-stubs')
+const TIMEOUT_MS         = parseIntFlag('--timeout', 6000, { min: 1 })
+const JSON_OUT           = flag('--json', null)
+// v2.3: --max-blocks overrides the per-family maxScanBlocks for every family in this run.
+// Useful for deep-history forensic scans: node scripts/drift-scanner.js --max-blocks 20000000
+const MAX_BLOCKS_OVERRIDE = (() => {
+  const v = parseInt(flag('--max-blocks', ''), 10)
+  return Number.isFinite(v) && v > 0 ? v : null
+})()
 
 // ── Protocol family definitions ────────────────────────────────────────────
 // Each family describes how to detect deployment and how to generate an adapter.
@@ -61,20 +67,19 @@ const FAMILIES = {
 
   'balancer-v2': {
     name: 'Balancer V2',
-    // Canonical vault deployed at the same address across all chains
-    detect: async (chain) => {
+    // v2.3: scan last 4M blocks — Balancer V2 launched Nov 2021 (~4M blocks ago on most chains)
+    maxScanBlocks: 4_000_000,
+    detect: async (chain, maxBlocks) => {
       const code = await getCode(chain, BALANCER_VAULT)
       if (code == null || code.length <= 4) return null
-      // Count registered pools via PoolRegistered event to estimate scale
       const pools = await countEvents(chain, BALANCER_VAULT,
-        '0x3c13bc30b8e878c53fd2a36b679409c073afd75950be43d8858768e956fbc20e')
+        '0x3c13bc30b8e878c53fd2a36b679409c073afd75950be43d8858768e956fbc20e',
+        maxBlocks)
       return { address: BALANCER_VAULT, pools }
     },
-    // Checks the adapter covers this chain
     coveredBy: (chain, adapters) =>
       adapters.some(a => adapterCoversChain(a, chain) &&
         adapterMentions(a, BALANCER_VAULT, 'onChainTvl', 'balancer')),
-    // Generate one-liner adapter
     stub: (chain, info) => ({
       slug: `balancer-${chain}`,
       code: `'use strict'\nconst { onChainTvl } = require('../helper/balancer')\nmodule.exports = {\n  timetravel: false,\n  ${chain}: { tvl: onChainTvl('${BALANCER_VAULT}', 0) },\n}\n`,
@@ -83,17 +88,18 @@ const FAMILIES = {
 
   'uniswap-v3': {
     name: 'Uniswap V3',
-    // Two known canonical factory addresses
     factories: [
       '0x1F98431c8aD98523631AE4a59f267346ea31F984',
       '0xcb2436774C3e191c85056d248EF4260ce5f27A9D',
     ],
     poolTopic: '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118',
-    detect: async function(chain) {
+    // v2.3: Uniswap V3 launched May 2021 — 4M blocks covers most deployments
+    maxScanBlocks: 4_000_000,
+    detect: async function(chain, maxBlocks) {
       for (const factory of this.factories) {
         const code = await getCode(chain, factory)
         if (code != null && code.length > 4) {
-          const pools = await countEvents(chain, factory, this.poolTopic)
+          const pools = await countEvents(chain, factory, this.poolTopic, maxBlocks)
           return { address: factory, pools }
         }
       }
@@ -110,13 +116,13 @@ const FAMILIES = {
 
   'algebra': {
     name: 'Algebra CLMM',
-    // Algebra Factory emits Pool(token0, token1, pool)
     poolTopic: '0x91ccaa7a278130b65168c3a0c8d3bcae84cf5e43704342bd3ec0b59e59c036db',
-    detect: async function(chain) {
-      const candidates = await findFactoriesFromEvents(chain, this.poolTopic)
+    // v2.3: 15M blocks — covers the mystery 2021 Ethereum Algebra factory (0xfb8ed348...).
+    // The 4M default used to miss it entirely; 15M unblocks deep-history Algebra scans.
+    maxScanBlocks: 15_000_000,
+    detect: async function(chain, maxBlocks) {
+      const candidates = await findFactoriesFromEvents(chain, this.poolTopic, maxBlocks)
       if (!candidates || !candidates.length) return null
-      // Validate: a real Algebra factory has code AND at least one emitted pool has code
-      // (removes false positives from non-factory contracts emitting the same topic)
       const validated = []
       for (const c of candidates) {
         const code = await getCode(chain, c.address)
@@ -128,7 +134,6 @@ const FAMILIES = {
         validated.push(c)
       }
       if (!validated.length) return null
-      // Return all validated factories so multi-factory chains each get a gap entry
       return validated.sort((a, b) => b.pools - a.pools)
     },
     coveredBy: (chain, info, adapters) =>
@@ -143,26 +148,26 @@ const FAMILIES = {
 
   'aave-v3': {
     name: 'Aave V3',
-    // PoolAddressesProvider factory: same across chains
     providerFactory: '0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e',
-    // Aave V3 Pool implementation fingerprint (getReservesList selector)
     poolSelector: '0xd1946dbc',
+    // v2.3: Aave V3 launched Jan 2023 — 6M blocks covers all deployments
+    maxScanBlocks: 6_000_000,
     detect: async (chain) => {
       const code = await getCode(chain, '0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e')
       if (code != null && code.length > 4) return { address: '0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e', pools: 1 }
-      // Fallback: check known Aave V3 pool addresses on each chain
       return null
     },
     coveredBy: (chain, adapters) =>
       adapters.some(a => adapterCoversChain(a, chain) &&
         adapterMentions(a, 'aave')),
-    stub: () => null, // Aave V3 is a shared adapter — add chain to projects/aave-v3/index.js, not a new directory
+    stub: () => null,
   },
 
   'curve': {
     name: 'Curve DEX',
-    // Curve AddressProvider: same on all chains
     addressProvider: '0x0000000022D53366457F9d5E68Ec105046FC4383',
+    // v2.3: Curve launched 2020 — 25M blocks for full history on Ethereum-class chains
+    maxScanBlocks: 25_000_000,
     detect: async (chain) => {
       const code = await getCode(chain, '0x0000000022D53366457F9d5E68Ec105046FC4383')
       if (code != null && code.length > 4) return { address: '0x0000000022D53366457F9d5E68Ec105046FC4383', pools: 1 }
@@ -171,14 +176,14 @@ const FAMILIES = {
     coveredBy: (chain, adapters) =>
       adapters.some(a => adapterCoversChain(a, chain) &&
         adapterMentions(a, 'curve')),
-    stub: () => null, // Curve is a shared adapter — add chain to projects/curve/index.js, not a new directory
+    stub: () => null,
   },
-
 
   'velodrome-cl': {
     name: 'Velodrome/Solidly CL',
-    // Standard CL factory address used by Velodrome and most Solidly forks
     factory: '0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F',
+    // v2.3: Velodrome launched 2022 — 2M blocks sufficient; uses callView not event scan
+    maxScanBlocks: 2_000_000,
     detect: async (chain) => {
       const factory = '0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F'
       const code = await getCode(chain, factory)
@@ -189,26 +194,27 @@ const FAMILIES = {
     coveredBy: (chain, adapters) =>
       adapters.some(a => adapterCoversChain(a, chain) &&
         adapterMentions(a, '0x04625B046C69577EfC40e6c0Bb83CDBAfab5a55F', 'velodrome', 'aerodrome')),
-    stub: () => null, // add chain to projects/velodrome-CL/index.js
+    stub: () => null,
   },
 
   'pancakeswap-v3': {
     name: 'PancakeSwap V3',
-    // Standard V3 factory — same address across BSC, Ethereum, Arbitrum, Base, etc.
     factory: '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865',
-    detect: async (chain) => {
+    // v2.3: PCS V3 launched Apr 2023 — 6M blocks covers all deployments
+    maxScanBlocks: 6_000_000,
+    detect: async (chain, maxBlocks) => {
       const factory = '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865'
       const code = await getCode(chain, factory)
       if (code == null || code.length <= 4) return null
-      // Count via PoolCreated event topic (same as Uniswap V3)
       const pools = await countEvents(chain, factory,
-        '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118')
+        '0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118',
+        maxBlocks)
       return { address: factory, pools }
     },
     coveredBy: (chain, adapters) =>
       adapters.some(a => adapterCoversChain(a, chain) &&
         adapterMentions(a, '0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865', 'pancakeswap')),
-    stub: () => null, // add chain to projects/pancakeswap-v3/index.js
+    stub: () => null,
   },
 
 }
@@ -566,6 +572,7 @@ async function main() {
   console.log(`═══════════════════════════════════════════════════════`)
   console.log(`Chains:   ${chains.length}  |  Families: ${familyKeys.join(', ')}`)
   console.log(`Adapters: ${adapters.length} existing  |  Concurrency: ${CONCURRENCY}`)
+  if (MAX_BLOCKS_OVERRIDE) console.log(`MaxBlocks override: ${MAX_BLOCKS_OVERRIDE.toLocaleString()} (--max-blocks)`)
   console.log(`═══════════════════════════════════════════════════════\n`)
 
   const tasks = []
@@ -573,9 +580,11 @@ async function main() {
     for (const familyKey of familyKeys) {
       const family = FAMILIES[familyKey]
       if (!family) { console.warn(`Unknown family: ${familyKey}`); continue }
+      // v2.3: resolve effective block window — CLI override beats family default
+      const effectiveMaxBlocks = MAX_BLOCKS_OVERRIDE ?? family.maxScanBlocks ?? 4_000_000
       tasks.push(async () => {
         try {
-          const detected = await family.detect(chain)
+          const detected = await family.detect(chain, effectiveMaxBlocks)
           if (!detected) return []
           // Algebra returns an array (one entry per factory); others return a single object
           const infos = Array.isArray(detected) ? detected : [detected]
@@ -632,6 +641,13 @@ async function main() {
     return `$${n.toFixed(0)}`.padStart(8)
   }
 
+  if (!MAX_BLOCKS_OVERRIDE) {
+    const windows = familyKeys.map(k => {
+      const mb = (FAMILIES[k]?.maxScanBlocks ?? 4_000_000) / 1_000_000
+      return `${k}=${mb}M`
+    }).join('  ')
+    console.log(`Scan windows (blocks): ${windows}`)
+  }
   console.log(`DEPLOYED BUT UNCOVERED — Top ${gaps.length} gaps ranked by chain TVL`)
   console.log(`${'Chain'.padEnd(18)} ${'Family'.padEnd(18)} ${'ChainTVL'.padStart(9)} ${'Pools'.padStart(6)}  Address`)
   console.log('─'.repeat(82))
